@@ -1,0 +1,179 @@
+services:
+  mysql:
+    image: mysql:latest
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: orders
+      MYSQL_USER: app
+      MYSQL_PASSWORD: apppass
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpass", "--silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - app-net
+
+  kafka:
+    image: apache/kafka:3.7.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - app-net
+
+  kafka-init:
+    image: apache/kafka:3.7.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - bash
+      - -c
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists --topic order-events \
+          --partitions 3 --replication-factor 1 &&
+        echo 'Topic order-events created'
+    networks:
+      - app-net
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - app-net
+
+  rabbitmq:
+    image: rabbitmq:3.10.7-management
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: apppass
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - app-net
+
+  flask-app:
+    build: ./flask-app
+    ports:
+      - "5000:5000"
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: orders
+      DB_USER: app
+      DB_PASSWORD: apppass
+      KAFKA_BOOTSTRAP: kafka:9092
+      RABBIT_HOST: rabbitmq
+      RABBIT_USER: app
+      RABBIT_PASS: apppass
+      RABBIT_QUEUE: order-notifications
+    depends_on:
+      mysql:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - app-net
+
+  payment-consumer:
+    build: ./consumers
+    command: ["python", "payment_consumer.py"]
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    networks:
+      - app-net
+
+  delivery-consumer:
+    build: ./consumers
+    command: ["python", "delivery_consumer.py"]
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    networks:
+      - app-net
+
+  rabbit-worker:
+    build: ./consumers
+    command: ["python", "rabbit_worker.py"]
+    environment:
+      RABBIT_HOST: rabbitmq
+      RABBIT_USER: app
+      RABBIT_PASS: apppass
+      RABBIT_QUEUE: order-notifications
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - app-net
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/html:/usr/share/nginx/html:ro
+    depends_on:
+      flask-app:
+        condition: service_healthy
+    networks:
+      - app-net
+
+volumes:
+  mysql_data:
+  kafka_data:
+
+networks:
+  app-net:
+    driver: bridge
